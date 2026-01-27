@@ -130,4 +130,74 @@ router.get('/verify', async (req, res) => {
   }
 })
 
+// 管理员修改密码接口
+router.put('/change-password', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '')
+    
+    if (!token) {
+      return res.status(401).json({ 
+        success: false, 
+        message: '未提供认证令牌' 
+      })
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET)
+    const { oldPassword, newPassword } = req.body
+
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ 
+        success: false, 
+        message: '请提供旧密码和新密码' 
+      })
+    }
+
+    // 获取当前用户信息
+    const tableName = decoded.userType === 'admin' ? 'admins' : 'students'
+    const [users] = await pool.query(
+      `SELECT * FROM ${tableName} WHERE id = ?`,
+      [decoded.id]
+    )
+
+    if (users.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: '用户不存在' 
+      })
+    }
+
+    const user = users[0]
+
+    // 验证旧密码
+    const isPasswordValid = await bcrypt.compare(oldPassword, user.password)
+    if (!isPasswordValid) {
+      return res.status(401).json({ 
+        success: false, 
+        message: '旧密码错误' 
+      })
+    }
+
+    // 加密新密码
+    const hashedPassword = await bcrypt.hash(newPassword, 10)
+
+    // 更新密码
+    await pool.query(
+      `UPDATE ${tableName} SET password = ? WHERE id = ?`,
+      [hashedPassword, decoded.id]
+    )
+
+    res.json({
+      success: true,
+      message: '密码修改成功'
+    })
+
+  } catch (error) {
+    console.error('修改密码错误:', error)
+    res.status(500).json({ 
+      success: false, 
+      message: '服务器错误，请稍后重试' 
+    })
+  }
+})
+
 export default router
