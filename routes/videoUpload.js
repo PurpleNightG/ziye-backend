@@ -15,8 +15,11 @@ const UPLOAD_URL = `http://up.abyss.to/${API_KEY}`
 const API_BASE_URL = 'https://api.abyss.to/v1'
 
 // 确保 uploads 目录存在
-const uploadDir = path.join(__dirname, '..', 'uploads')
-if (!fs.existsSync(uploadDir)) {
+// Vercel环境使用 /tmp 目录（只读文件系统），本地开发使用 uploads 目录
+const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true'
+const uploadDir = isVercel ? '/tmp' : path.join(__dirname, '..', 'uploads')
+
+if (!isVercel && !fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true })
 }
 
