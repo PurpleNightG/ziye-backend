@@ -50,11 +50,11 @@ router.put('/order', async (req, res) => {
         )
       }
       
-      // 第二阶段：更新为最终的code和order
+      // 第二阶段：更新为最终的code、order和name
       for (const course of courses) {
         await connection.query(
-          'UPDATE courses SET code = ?, `order` = ? WHERE id = ?',
-          [course.code, course.order, course.id]
+          'UPDATE courses SET code = ?, `order` = ?, name = ? WHERE id = ?',
+          [course.code, course.order, course.name, course.id]
         )
       }
       
@@ -174,25 +174,170 @@ router.put('/batch/update', async (req, res) => {
   }
 })
 
+const DEFAULT_CATEGORIES = [
+  { name: '入门课程', color: 'purple' },
+  { name: '标准技能一阶课程', color: 'blue' },
+  { name: '标准技能二阶课程', color: 'cyan' },
+  { name: '团队训练', color: 'yellow' },
+  { name: '进阶课程', color: 'orange' },
+]
+const DEFAULT_DIFFICULTIES = [
+  { name: '初级', color: 'green' },
+  { name: '中级', color: 'blue' },
+  { name: '高级', color: 'red' },
+]
+const ALLOWED_COLORS = new Set([
+  'purple',
+  'blue',
+  'cyan',
+  'yellow',
+  'orange',
+  'green',
+  'red',
+  'pink',
+  'gray',
+  'blackgold',
+  'blacksilver',
+  'blackcopper',
+  'blackrose',
+  'blackice',
+  'blackviolet',
+  'blackemerald',
+])
+
+function normalizeColor(raw, fallback = 'purple') {
+  const c = String(raw || '').trim().toLowerCase()
+  return ALLOWED_COLORS.has(c) ? c : fallback
+}
+
+async function ensureCourseMetaOptions() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS course_meta_options (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      kind ENUM('category', 'difficulty') NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      color VARCHAR(32) NOT NULL DEFAULT 'purple',
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_kind_name (kind, name),
+      INDEX idx_kind_order (kind, sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
+  try {
+    await pool.query(`
+      ALTER TABLE course_meta_options
+      ADD COLUMN color VARCHAR(32) NOT NULL DEFAULT 'purple' AFTER name
+    `)
+  } catch (e) {
+    if (e.code !== 'ER_DUP_FIELDNAME') throw e
+  }
+}
+
+async function listMetaOptions(kind) {
+  await ensureCourseMetaOptions()
+  const [rows] = await pool.query(
+    `SELECT name, color, sort_order FROM course_meta_options WHERE kind = ? ORDER BY sort_order ASC, id ASC`,
+    [kind]
+  )
+  if (rows.length) {
+    return rows.map((r) => ({
+      name: r.name,
+      color: normalizeColor(r.color),
+    }))
+  }
+
+  const defaults = kind === 'category' ? DEFAULT_CATEGORIES : DEFAULT_DIFFICULTIES
+  const col = kind === 'category' ? 'category' : 'difficulty'
+  const items = defaults.map((d) => ({ ...d }))
+  try {
+    const [used] = await pool.query(
+      `SELECT DISTINCT \`${col}\` AS name FROM courses WHERE \`${col}\` IS NOT NULL AND \`${col}\` != ''`
+    )
+    const palette = [...ALLOWED_COLORS]
+    for (const row of used) {
+      if (row.name && !items.some((x) => x.name === row.name)) {
+        items.push({
+          name: row.name,
+          color: palette[items.length % palette.length],
+        })
+      }
+    }
+  } catch {
+    // courses 表可能尚未创建
+  }
+  for (let i = 0; i < items.length; i++) {
+    await pool.query(
+      `INSERT IGNORE INTO course_meta_options (kind, name, color, sort_order) VALUES (?, ?, ?, ?)`,
+      [kind, items[i].name, items[i].color, i]
+    )
+  }
+  return items
+}
+
+async function replaceMetaOptions(kind, input) {
+  await ensureCourseMetaOptions()
+  const cleaned = []
+  const seen = new Set()
+  const palette = [...ALLOWED_COLORS]
+  for (let i = 0; i < (input || []).length; i++) {
+    const raw = input[i]
+    const name = String(typeof raw === 'string' ? raw : raw?.name || '').trim()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    const color = normalizeColor(
+      typeof raw === 'object' ? raw?.color : null,
+      palette[cleaned.length % palette.length]
+    )
+    cleaned.push({ name, color })
+  }
+  if (!cleaned.length) {
+    throw Object.assign(new Error('至少保留一项'), { status: 400 })
+  }
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+    await conn.query(`DELETE FROM course_meta_options WHERE kind = ?`, [kind])
+    for (let i = 0; i < cleaned.length; i++) {
+      await conn.query(
+        `INSERT INTO course_meta_options (kind, name, color, sort_order) VALUES (?, ?, ?, ?)`,
+        [kind, cleaned[i].name, cleaned[i].color, i]
+      )
+    }
+    await conn.commit()
+  } catch (e) {
+    await conn.rollback()
+    throw e
+  } finally {
+    conn.release()
+  }
+  return cleaned
+}
+
 // 获取类别配置（必须在/:id之前）
 router.get('/config/categories', async (req, res) => {
   try {
-    const [rows] = await pool.query(`
-      SELECT DISTINCT category FROM courses
-      ORDER BY MIN(\`order\`)
-    `)
-    
-    const categories = rows.map(row => row.category)
-    
-    res.json({
-      success: true,
-      data: categories
-    })
+    const categories = await listMetaOptions('category')
+    res.json({ success: true, data: categories })
   } catch (error) {
     console.error('获取类别配置失败:', error)
     res.status(500).json({
       success: false,
-      message: '获取类别配置失败'
+      message: '获取类别配置失败',
+    })
+  }
+})
+
+// 更新类别配置（必须在/:id之前）
+router.put('/config/categories', async (req, res) => {
+  try {
+    const categories = await replaceMetaOptions('category', req.body?.categories)
+    res.json({ success: true, data: categories, message: '类别配置已保存' })
+  } catch (error) {
+    console.error('更新类别配置失败:', error)
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.status === 400 ? error.message : '更新类别配置失败',
     })
   }
 })
@@ -200,28 +345,27 @@ router.get('/config/categories', async (req, res) => {
 // 获取难度配置（必须在/:id之前）
 router.get('/config/difficulties', async (req, res) => {
   try {
-    const [rows] = await pool.query(`
-      SELECT DISTINCT difficulty FROM courses
-      ORDER BY 
-        CASE difficulty
-          WHEN '初级' THEN 1
-          WHEN '中级' THEN 2
-          WHEN '高级' THEN 3
-          ELSE 4
-        END
-    `)
-    
-    const difficulties = rows.map(row => row.difficulty)
-    
-    res.json({
-      success: true,
-      data: difficulties
-    })
+    const difficulties = await listMetaOptions('difficulty')
+    res.json({ success: true, data: difficulties })
   } catch (error) {
     console.error('获取难度配置失败:', error)
     res.status(500).json({
       success: false,
-      message: '获取难度配置失败'
+      message: '获取难度配置失败',
+    })
+  }
+})
+
+// 更新难度配置（必须在/:id之前）
+router.put('/config/difficulties', async (req, res) => {
+  try {
+    const difficulties = await replaceMetaOptions('difficulty', req.body?.difficulties)
+    res.json({ success: true, data: difficulties, message: '难度配置已保存' })
+  } catch (error) {
+    console.error('更新难度配置失败:', error)
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.status === 400 ? error.message : '更新难度配置失败',
     })
   }
 })
@@ -363,7 +507,7 @@ router.put('/:id', async (req, res) => {
     
     // 检查课程是否存在
     const [existing] = await pool.query(
-      'SELECT id FROM courses WHERE id = ?',
+      'SELECT id, `order` FROM courses WHERE id = ?',
       [id]
     )
     
@@ -405,7 +549,7 @@ router.put('/:id', async (req, res) => {
       category,
       difficulty,
       hours,
-      order,
+      order ?? existing[0].order,
       description || '',
       id
     ])

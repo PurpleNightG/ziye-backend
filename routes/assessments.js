@@ -1,7 +1,21 @@
 import express from 'express'
 import { pool } from '../config/database.js'
+import { authenticateRequest } from '../utils/authGate.js'
 
 const router = express.Router()
+
+async function requireStudentSelf(req, res, memberId) {
+  const auth = await authenticateRequest(req, { requireType: 'student' })
+  if (!auth) {
+    res.status(401).json({ success: false, message: '未登录或会话已失效，请重新登录' })
+    return null
+  }
+  if (Number(auth.userId) !== Number(memberId)) {
+    res.status(403).json({ success: false, message: '只能查看自己的数据' })
+    return null
+  }
+  return auth
+}
 
 // 格式化日期为YYYY-MM-DD
 function formatDate(dateString) {
@@ -26,8 +40,11 @@ function calculateRating(score) {
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT * FROM assessments
-      ORDER BY assessment_date DESC, created_at DESC
+      SELECT a.*, m.avatar AS avatar, m.qq AS qq
+      FROM assessments a
+      LEFT JOIN members m ON m.id = a.member_id
+      WHERE m.status IS NOT NULL AND m.status != '已退队'
+      ORDER BY a.assessment_date DESC, a.created_at DESC
     `)
     
     // 解析JSON字段
@@ -67,7 +84,8 @@ router.get('/', async (req, res) => {
 router.get('/member/:memberId', async (req, res) => {
   try {
     const { memberId } = req.params
-    
+    if (!(await requireStudentSelf(req, res, memberId))) return
+
     const [rows] = await pool.query(`
       SELECT * FROM assessments
       WHERE member_id = ?

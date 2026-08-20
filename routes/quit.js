@@ -3,12 +3,23 @@ import { pool } from '../config/database.js'
 
 const router = express.Router()
 
-// 获取所有退队审批
+// 获取所有退队审批（已批准的归档成员不再出现在列表中）
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT * FROM quit_approvals
-      ORDER BY apply_date DESC
+      SELECT 
+        qa.*,
+        COALESCE(a.name, qa.source_admin_name) as source_admin_name,
+        COALESCE(b.name, qa.approver_name) as approver_name,
+        COALESCE(am.nickname, qa.source_assistant_name) as source_assistant_name,
+        m.avatar AS avatar
+      FROM quit_approvals qa
+      LEFT JOIN admins a ON qa.source_admin_id = a.id
+      LEFT JOIN admins b ON qa.approver_id = b.id
+      LEFT JOIN members am ON am.id = qa.source_assistant_id
+      LEFT JOIN members m ON m.id = qa.member_id
+      WHERE qa.status != '已批准'
+      ORDER BY qa.apply_date DESC
     `)
     
     res.json({

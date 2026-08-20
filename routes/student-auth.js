@@ -2,6 +2,18 @@ import express from 'express'
 import { pool } from '../config/database.js'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
+import {
+  createLoginSession,
+  assertSessionActive,
+  touchSession,
+  revokeAllSessions,
+  getClientIp,
+} from '../utils/loginSessions.js'
+import {
+  checkLoginAllowed,
+  recordLoginFailure,
+  recordLoginSuccess,
+} from '../utils/loginRateLimit.js'
 
 const router = express.Router()
 
@@ -9,62 +21,81 @@ const router = express.Router()
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body
-    
+    const rememberMe = req.body?.rememberMe !== false && req.body?.rememberMe !== 0
+    const ip = getClientIp(req)
+
     if (!username || !password) {
       return res.status(400).json({
         success: false,
         message: '请输入用户名和密码'
       })
     }
-    
+
+    const rate = checkLoginAllowed(ip, username)
+    if (!rate.ok) {
+      return res.status(429).json({ success: false, message: rate.message })
+    }
+
     // 查询成员（用户名即昵称）
     const [members] = await pool.query(
       'SELECT * FROM members WHERE username = ? OR nickname = ?',
       [username, username]
     )
-    
+
     if (members.length === 0) {
+      recordLoginFailure(ip, username)
       return res.status(401).json({
         success: false,
         message: '用户名或密码错误'
       })
     }
-    
+
     const member = members[0]
-    
+
     // 检查成员状态
     if (member.status === '已退队') {
       return res.status(403).json({
         success: false,
-        message: '您已退队，无法登录'
+        message: '账号异常，无法登录'
       })
     }
-    
+
     // 验证密码
     const isPasswordValid = await bcrypt.compare(password, member.password)
-    
+
     if (!isPasswordValid) {
+      recordLoginFailure(ip, username)
       return res.status(401).json({
         success: false,
         message: '用户名或密码错误'
       })
     }
-    
+
+    recordLoginSuccess(ip, username)
+
+    const sessionId = await createLoginSession(req, {
+      userType: 'student',
+      userId: member.id,
+      deviceName: req.body?.deviceName,
+      rememberMe,
+    })
+
     // 生成JWT token
     const token = jwt.sign(
       {
         id: member.id,
         username: member.username,
         nickname: member.nickname,
-        role: 'student'
+        role: 'student',
+        jti: sessionId,
       },
       process.env.JWT_SECRET || 'your-secret-key',
-      { expiresIn: '7d' }
+      { expiresIn: rememberMe ? '7d' : '1d' }
     )
-    
+
     // 返回成员信息（不含密码）
     const { password: _, ...memberInfo } = member
-    
+
     res.json({
       success: true,
       message: '登录成功',
@@ -86,31 +117,54 @@ router.post('/login', async (req, res) => {
 router.get('/verify', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '')
-    
+
     if (!token) {
       return res.status(401).json({
         success: false,
         message: '未提供token'
       })
     }
-    
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key')
-    
+    const active = await assertSessionActive(decoded)
+    if (!active) {
+      return res.status(401).json({
+        success: false,
+        message: '会话已失效，请重新登录',
+      })
+    }
+    void touchSession(decoded.jti)
+
     // 查询最新的成员信息
     const [members] = await pool.query(
       'SELECT * FROM members WHERE id = ?',
       [decoded.id]
     )
-    
-    if (members.length === 0 || members[0].status === '已退队') {
-      return res.status(403).json({
+
+    if (members.length === 0) {
+      try {
+        await revokeAllSessions('student', decoded.id)
+      } catch { /* ignore */ }
+      return res.status(401).json({
         success: false,
-        message: '账号不存在或已退队'
+        message: '账号已不存在或已删除，请重新登录',
+        code: 'ACCOUNT_GONE',
       })
     }
-    
+
+    if (members[0].status === '已退队') {
+      try {
+        await revokeAllSessions('student', decoded.id)
+      } catch { /* ignore */ }
+      return res.status(403).json({
+        success: false,
+        message: '账号不存在或已退队',
+        code: 'ACCOUNT_GONE',
+      })
+    }
+
     const { password: _, ...memberInfo } = members[0]
-    
+
     res.json({
       success: true,
       data: {
@@ -129,61 +183,64 @@ router.get('/verify', async (req, res) => {
 router.put('/change-password', async (req, res) => {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '')
-    
+
     if (!token) {
       return res.status(401).json({
         success: false,
         message: '未登录'
       })
     }
-    
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key')
     const { oldPassword, newPassword } = req.body
-    
+
     if (!oldPassword || !newPassword) {
       return res.status(400).json({
         success: false,
         message: '请输入旧密码和新密码'
       })
     }
-    
+
     // 获取成员信息
     const [members] = await pool.query(
       'SELECT * FROM members WHERE id = ?',
       [decoded.id]
     )
-    
+
     if (members.length === 0) {
       return res.status(404).json({
         success: false,
         message: '成员不存在'
       })
     }
-    
+
     const member = members[0]
-    
+
     // 验证旧密码
     const isOldPasswordValid = await bcrypt.compare(oldPassword, member.password)
-    
+
     if (!isOldPasswordValid) {
       return res.status(401).json({
         success: false,
         message: '旧密码错误'
       })
     }
-    
+
     // 加密新密码
     const hashedPassword = await bcrypt.hash(newPassword, 10)
-    
+
     // 更新密码
     await pool.query(
       'UPDATE members SET password = ? WHERE id = ?',
       [hashedPassword, decoded.id]
     )
-    
+
+    await revokeAllSessions('student', decoded.id)
+
     res.json({
       success: true,
-      message: '密码修改成功'
+      message: '密码修改成功，请重新登录',
+      data: { force_relogin: true },
     })
   } catch (error) {
     console.error('修改密码失败:', error)

@@ -1,14 +1,54 @@
 import express from 'express'
 import { pool } from '../config/database.js'
+import jwt from 'jsonwebtoken'
 
 const router = express.Router()
+
+function requireStudentToken(req, res) {
+  const token = req.headers.authorization?.replace('Bearer ', '')
+  if (!token) {
+    res.status(401).json({ success: false, message: '未登录' })
+    return null
+  }
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key')
+    if (decoded.role !== 'student' && decoded.userType !== 'student') {
+      res.status(403).json({ success: false, message: '仅学员可访问' })
+      return null
+    }
+    return decoded
+  } catch {
+    res.status(401).json({ success: false, message: '登录已失效' })
+    return null
+  }
+}
+
+// 学员获取自己的黑点记录
+router.get('/my', async (req, res) => {
+  try {
+    const decoded = requireStudentToken(req, res)
+    if (!decoded) return
+    const memberId = decoded.id
+
+    const [rows] = await pool.query(`
+      SELECT * FROM black_point_records WHERE member_id = ? ORDER BY register_date DESC
+    `, [memberId])
+    res.json({ success: true, data: rows })
+  } catch (error) {
+    console.error('获取个人黑点记录失败:', error)
+    res.status(500).json({ success: false, message: '获取黑点记录失败' })
+  }
+})
 
 // 获取所有黑点记录
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT * FROM black_point_records
-      ORDER BY register_date DESC
+      SELECT bp.*, m.avatar AS avatar
+      FROM black_point_records bp
+      LEFT JOIN members m ON m.id = bp.member_id
+      WHERE m.status IS NOT NULL AND m.status != '已退队'
+      ORDER BY bp.register_date DESC
     `)
     
     res.json({

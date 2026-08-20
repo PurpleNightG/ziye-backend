@@ -1,7 +1,39 @@
 import express from 'express'
 import { pool } from '../config/database.js'
+import { authenticateRequest } from '../utils/authGate.js'
 
 const router = express.Router()
+
+// 学员端：自己的课程进度
+router.get('/my', async (req, res) => {
+  try {
+    const auth = await authenticateRequest(req, { requireType: 'student' })
+    if (!auth) {
+      return res.status(401).json({ success: false, message: '未登录或会话已失效，请重新登录' })
+    }
+    const memberId = auth.userId
+
+    const [courses] = await pool.query(`
+      SELECT 
+        c.id,
+        c.code,
+        c.name,
+        c.category,
+        c.difficulty,
+        c.hours,
+        COALESCE(scp.progress, 0) as progress
+      FROM courses c
+      LEFT JOIN student_course_progress scp 
+        ON c.id = scp.course_id AND scp.member_id = ?
+      ORDER BY c.\`order\`
+    `, [memberId])
+
+    res.json({ success: true, data: courses })
+  } catch (error) {
+    console.error('获取个人课程进度失败:', error)
+    res.status(500).json({ success: false, message: '获取课程进度失败' })
+  }
+})
 
 // 获取所有成员及其进度信息
 router.get('/members', async (req, res) => {
@@ -10,8 +42,11 @@ router.get('/members', async (req, res) => {
       SELECT 
         m.id,
         m.nickname as name,
+        m.avatar,
+        m.qq,
         m.stage_role as status,
         m.join_date,
+        m.last_training_date,
         COUNT(DISTINCT scp.course_id) as completed_courses,
         (SELECT COUNT(*) FROM courses) as total_courses
       FROM members m
@@ -64,6 +99,70 @@ router.get('/member/:memberId', async (req, res) => {
     res.status(500).json({
       success: false,
       message: '获取成员课程进度失败'
+    })
+  }
+})
+
+/**
+ * 批量预览：多成员课程进度汇总
+ * body: { memberIds: number[] }
+ * 返回每门课：progress（全员一致时的值）、mixed（是否不一致）
+ */
+router.post('/batch/courses', async (req, res) => {
+  try {
+    const memberIds = (req.body?.memberIds || [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0)
+
+    if (memberIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'memberIds参数必须是非空数组',
+      })
+    }
+
+    const placeholders = memberIds.map(() => '?').join(',')
+    const [courses] = await pool.query(`
+      SELECT
+        c.id,
+        c.code,
+        c.name,
+        c.category,
+        c.difficulty,
+        c.hours,
+        COUNT(DISTINCT COALESCE(scp.progress, 0)) AS distinct_progress,
+        MIN(COALESCE(scp.progress, 0)) AS min_progress,
+        MAX(COALESCE(scp.progress, 0)) AS max_progress
+      FROM courses c
+      CROSS JOIN (
+        SELECT id AS member_id FROM members WHERE id IN (${placeholders})
+      ) m
+      LEFT JOIN student_course_progress scp
+        ON scp.course_id = c.id AND scp.member_id = m.member_id
+      GROUP BY c.id, c.code, c.name, c.category, c.difficulty, c.hours, c.\`order\`
+      ORDER BY c.\`order\`
+    `, memberIds)
+
+    const data = (courses || []).map((row) => {
+      const mixed = Number(row.distinct_progress) > 1
+      return {
+        id: row.id,
+        code: row.code,
+        name: row.name,
+        category: row.category,
+        difficulty: row.difficulty,
+        hours: row.hours,
+        progress: mixed ? null : Number(row.min_progress) || 0,
+        mixed,
+      }
+    })
+
+    res.json({ success: true, data })
+  } catch (error) {
+    console.error('批量预览课程进度失败:', error)
+    res.status(500).json({
+      success: false,
+      message: '批量预览课程进度失败',
     })
   }
 })

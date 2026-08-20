@@ -7,8 +7,11 @@ const router = express.Router()
 router.get('/', async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT * FROM retention_records
-      ORDER BY approval_date DESC
+      SELECT rr.*, m.avatar AS avatar
+      FROM retention_records rr
+      LEFT JOIN members m ON m.id = rr.member_id
+      WHERE m.status IS NOT NULL AND m.status != '已退队'
+      ORDER BY rr.approval_date DESC
     `)
     
     res.json({
